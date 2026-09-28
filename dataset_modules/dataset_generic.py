@@ -40,6 +40,9 @@ class Generic_WSI_Classification_Dataset(Dataset):
 		patient_strat=False,
 		label_col = None,
 		patient_voting = 'max',
+		custom_preprocessing = None,
+		exclude_nulls = False,
+		is_regression = False,
 		):
 		"""
 		Args:
@@ -49,9 +52,19 @@ class Generic_WSI_Classification_Dataset(Dataset):
 			print_info (boolean): Whether to print a summary of the dataset
 			label_dict (dict): Dictionary with key, value pairs for converting str labels to int
 			ignore (list): List containing class labels to ignore
+			patient_strat (boolean): Whether to stratify by patients
+			label_col (string): Column name in the CSV file containing the labels
+			patient_voting (string): Method for determining patient-level labels ('max' or 'maj')
+			custom_preprocessing (function): Custom preprocessing function to apply to the dataframe
+			exclude_nulls (boolean): Whether to exclude 0, null, and nan values (useful for regression tasks)
+			is_regression (boolean): Whether this is a regression task
 		"""
 		self.label_dict = label_dict
-		self.num_classes = len(set(self.label_dict.values()))
+		self.is_regression = is_regression
+		if self.is_regression:
+			self.num_classes = 1
+		else:
+			self.num_classes = len(set(self.label_dict.values()))
 		self.seed = seed
 		self.print_info = print_info
 		self.patient_strat = patient_strat
@@ -62,8 +75,13 @@ class Generic_WSI_Classification_Dataset(Dataset):
 		self.label_col = label_col
 
 		slide_data = pd.read_csv(csv_path)
+
+		# Apply custom preprocessing if provided
+		if custom_preprocessing is not None:
+			slide_data = custom_preprocessing(slide_data)
+
 		slide_data = self.filter_df(slide_data, filter_dict)
-		slide_data = self.df_prep(slide_data, self.label_dict, ignore, self.label_col)
+		slide_data = self.df_prep(slide_data, self.label_dict, ignore, self.label_col, exclude_nulls)
 
 		###shuffle data
 		if shuffle:
@@ -79,20 +97,25 @@ class Generic_WSI_Classification_Dataset(Dataset):
 			self.summarize()
 
 	def cls_ids_prep(self):
-		# store ids corresponding each class at the patient or case level
-		self.patient_cls_ids = [[] for i in range(self.num_classes)]		
-		for i in range(self.num_classes):
-			self.patient_cls_ids[i] = np.where(self.patient_data['label'] == i)[0]
+		if self.is_regression:
+			# For regression, treat all samples as a single class
+			self.patient_cls_ids = [np.arange(len(self.patient_data['case_id']))]
+			self.slide_cls_ids = [np.arange(len(self.slide_data))]
+		else:
+			# store ids corresponding each class at the patient or case level
+			self.patient_cls_ids = [[] for i in range(self.num_classes)]		
+			for i in range(self.num_classes):
+				self.patient_cls_ids[i] = np.where(self.patient_data['label'] == i)[0]
 
-		# store ids corresponding each class at the slide level
-		self.slide_cls_ids = [[] for i in range(self.num_classes)]
-		for i in range(self.num_classes):
-			self.slide_cls_ids[i] = np.where(self.slide_data['label'] == i)[0]
+			# store ids corresponding each class at the slide level
+			self.slide_cls_ids = [[] for i in range(self.num_classes)]
+			for i in range(self.num_classes):
+				self.slide_cls_ids[i] = np.where(self.slide_data['label'] == i)[0]
 
 	def patient_data_prep(self, patient_voting='max'):
 		patients = np.unique(np.array(self.slide_data['case_id'])) # get unique patients
 		patient_labels = []
-		
+
 		for p in patients:
 			locations = self.slide_data[self.slide_data['case_id'] == p].index.tolist()
 			assert len(locations) > 0
@@ -104,20 +127,36 @@ class Generic_WSI_Classification_Dataset(Dataset):
 			else:
 				raise NotImplementedError
 			patient_labels.append(label)
-		
+
 		self.patient_data = {'case_id':patients, 'label':np.array(patient_labels)}
 
 	@staticmethod
-	def df_prep(data, label_dict, ignore, label_col):
+	def df_prep(data, label_dict, ignore, label_col, exclude_nulls=False):
 		if label_col != 'label':
 			data['label'] = data[label_col].copy()
 
-		mask = data['label'].isin(ignore)
-		data = data[~mask]
-		data.reset_index(drop=True, inplace=True)
-		for i in data.index:
-			key = data.loc[i, 'label']
-			data.at[i, 'label'] = label_dict[key]
+		# Handle ignore list for categorical labels
+		if ignore:
+			mask = data['label'].isin(ignore)
+			data = data[~mask]
+			data.reset_index(drop=True, inplace=True)
+
+		# non-default label columns (e.g. ERP_label) hold numbers
+		if label_col != 'label' or exclude_nulls:
+			# Convert to numeric if not already
+			data['label'] = pd.to_numeric(data['label'], errors='coerce')
+
+		if exclude_nulls:
+			# drop slides without a measured value (stored as 0 or empty)
+			mask = (data['label'] == 0) | (data['label'].isnull())
+			data = data[~mask]
+			data.reset_index(drop=True, inplace=True)
+
+		# Apply label_dict mapping for categorical labels
+		if label_dict:
+			for i in data.index:
+				key = data.loc[i, 'label']
+				data.at[i, 'label'] = label_dict[key]
 
 		return data
 
@@ -147,14 +186,15 @@ class Generic_WSI_Classification_Dataset(Dataset):
 			print('Patient-LVL; Number of samples registered in class %d: %d' % (i, self.patient_cls_ids[i].shape[0]))
 			print('Slide-LVL; Number of samples registered in class %d: %d' % (i, self.slide_cls_ids[i].shape[0]))
 
-	def create_splits(self, k = 3, val_num = (25, 25), test_num = (40, 40), label_frac = 1.0, custom_test_ids = None):
+	def create_splits(self, k = 3, val_num = (25, 25), test_num = (40, 40), label_frac = 1.0, custom_test_ids = None, non_overlapping_splits = True):
 		settings = {
 					'n_splits' : k, 
 					'val_num' : val_num, 
 					'test_num': test_num,
 					'label_frac': label_frac,
 					'seed': self.seed,
-					'custom_test_ids': custom_test_ids
+					'custom_test_ids': custom_test_ids,
+					'non_overlapping_splits': non_overlapping_splits
 					}
 
 		if self.patient_strat:
@@ -195,7 +235,7 @@ class Generic_WSI_Classification_Dataset(Dataset):
 			split = Generic_Split(df_slice, data_dir=self.data_dir, num_classes=self.num_classes)
 		else:
 			split = None
-		
+
 		return split
 
 	def get_merged_split_from_df(self, all_splits, split_keys=['train']):
@@ -211,7 +251,7 @@ class Generic_WSI_Classification_Dataset(Dataset):
 			split = Generic_Split(df_slice, data_dir=self.data_dir, num_classes=self.num_classes)
 		else:
 			split = None
-		
+
 		return split
 
 
@@ -225,29 +265,29 @@ class Generic_WSI_Classification_Dataset(Dataset):
 
 			else:
 				train_split = None
-			
+
 			if len(self.val_ids) > 0:
 				val_data = self.slide_data.loc[self.val_ids].reset_index(drop=True)
 				val_split = Generic_Split(val_data, data_dir=self.data_dir, num_classes=self.num_classes)
 
 			else:
 				val_split = None
-			
+
 			if len(self.test_ids) > 0:
 				test_data = self.slide_data.loc[self.test_ids].reset_index(drop=True)
 				test_split = Generic_Split(test_data, data_dir=self.data_dir, num_classes=self.num_classes)
-			
+
 			else:
 				test_split = None
-			
-		
+
+
 		else:
 			assert csv_path 
 			all_splits = pd.read_csv(csv_path, dtype=self.slide_data['slide_id'].dtype)  # Without "dtype=self.slide_data['slide_id'].dtype", read_csv() will convert all-number columns to a numerical type. Even if we convert numerical columns back to objects later, we may lose zero-padding in the process; the columns must be correctly read in from the get-go. When we compare the individual train/val/test columns to self.slide_data['slide_id'] in the get_split_from_df() method, we cannot compare objects (strings) to numbers or even to incorrectly zero-padded objects/strings. An example of this breaking is shown in https://github.com/andrew-weisman/clam_analysis/tree/main/datatype_comparison_bug-2021-12-01.
 			train_split = self.get_split_from_df(all_splits, 'train')
 			val_split = self.get_split_from_df(all_splits, 'val')
 			test_split = self.get_split_from_df(all_splits, 'test')
-			
+
 		return train_split, val_split, test_split
 
 	def get_list(self, ids):
@@ -262,9 +302,15 @@ class Generic_WSI_Classification_Dataset(Dataset):
 	def test_split_gen(self, return_descriptor=False):
 
 		if return_descriptor:
-			index = [list(self.label_dict.keys())[list(self.label_dict.values()).index(i)] for i in range(self.num_classes)]
-			columns = ['train', 'val', 'test']
-			df = pd.DataFrame(np.full((len(index), len(columns)), 0, dtype=np.int32), index= index,
+			if self.is_regression:
+				# For regression, create a simple descriptor with just one row
+				columns = ['train', 'val', 'test']
+				df = pd.DataFrame(np.full((1, len(columns)), 0, dtype=np.int32), index=['regression'],
+							columns= columns)
+			else:
+				index = [list(self.label_dict.keys())[list(self.label_dict.values()).index(i)] for i in range(self.num_classes)]
+				columns = ['train', 'val', 'test']
+				df = pd.DataFrame(np.full((len(index), len(columns)), 0, dtype=np.int32), index= index,
 							columns= columns)
 
 		count = len(self.train_ids)
@@ -274,8 +320,12 @@ class Generic_WSI_Classification_Dataset(Dataset):
 		for u in range(len(unique)):
 			print('number of samples in cls {}: {}'.format(unique[u], counts[u]))
 			if return_descriptor:
-				df.loc[index[u], 'train'] = counts[u]
-		
+				if self.is_regression:
+					# For regression, update the single row
+					df.loc['regression', 'train'] = count
+				else:
+					df.loc[index[u], 'train'] = counts[u]
+
 		count = len(self.val_ids)
 		print('\nnumber of val samples: {}'.format(count))
 		labels = self.getlabel(self.val_ids)
@@ -283,7 +333,11 @@ class Generic_WSI_Classification_Dataset(Dataset):
 		for u in range(len(unique)):
 			print('number of samples in cls {}: {}'.format(unique[u], counts[u]))
 			if return_descriptor:
-				df.loc[index[u], 'val'] = counts[u]
+				if self.is_regression:
+					# For regression, update the single row
+					df.loc['regression', 'val'] = count
+				else:
+					df.loc[index[u], 'val'] = counts[u]
 
 		count = len(self.test_ids)
 		print('\nnumber of test samples: {}'.format(count))
@@ -292,7 +346,11 @@ class Generic_WSI_Classification_Dataset(Dataset):
 		for u in range(len(unique)):
 			print('number of samples in cls {}: {}'.format(unique[u], counts[u]))
 			if return_descriptor:
-				df.loc[index[u], 'test'] = counts[u]
+				if self.is_regression:
+					# For regression, update the single row
+					df.loc['regression', 'test'] = count
+				else:
+					df.loc[index[u], 'test'] = counts[u]
 
 		assert len(np.intersect1d(self.train_ids, self.test_ids)) == 0
 		assert len(np.intersect1d(self.train_ids, self.val_ids)) == 0
@@ -316,10 +374,10 @@ class Generic_MIL_Dataset(Generic_WSI_Classification_Dataset):
 	def __init__(self,
 		data_dir, 
 		**kwargs):
-	
+
 		super(Generic_MIL_Dataset, self).__init__(**kwargs)
 		self.data_dir = data_dir
-		self.use_h5 = False
+		self.use_h5 = True
 
 	def load_from_h5(self, toggle):
 		self.use_h5 = toggle
@@ -338,12 +396,15 @@ class Generic_MIL_Dataset(Generic_WSI_Classification_Dataset):
 				full_path = os.path.join(data_dir, 'pt_files', '{}.pt'.format(slide_id))
 				features = torch.load(full_path)
 				return features, label
-			
+
 			else:
 				return slide_id, label
 
 		else:
 			full_path = os.path.join(data_dir,'h5_files','{}.h5'.format(slide_id))
+			if not os.path.isfile(full_path):
+				# TRIDENT writes <features_dir>/<slide_id>.h5 without the h5_files subfolder
+				full_path = os.path.join(data_dir,'{}.h5'.format(slide_id))
 			with h5py.File(full_path,'r') as hdf5_file:
 				features = hdf5_file['features'][:]
 				coords = hdf5_file['coords'][:]
@@ -354,7 +415,7 @@ class Generic_MIL_Dataset(Generic_WSI_Classification_Dataset):
 
 class Generic_Split(Generic_MIL_Dataset):
 	def __init__(self, slide_data, data_dir=None, num_classes=2):
-		self.use_h5 = False
+		self.use_h5 = True
 		self.slide_data = slide_data
 		self.data_dir = data_dir
 		self.num_classes = num_classes
@@ -364,6 +425,3 @@ class Generic_Split(Generic_MIL_Dataset):
 
 	def __len__(self):
 		return len(self.slide_data)
-		
-
-

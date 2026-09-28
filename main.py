@@ -9,7 +9,7 @@ import math
 from utils.file_utils import save_pkl, load_pkl
 from utils.utils import *
 from utils.core_utils import train
-from dataset_modules.dataset_generic import Generic_WSI_Classification_Dataset, Generic_MIL_Dataset
+from dataset_modules.espwa_tasks import TASKS, build_dataset
 
 # pytorch imports
 import torch
@@ -26,14 +26,12 @@ def main(args):
     if not os.path.isdir(args.results_dir):
         os.mkdir(args.results_dir)
 
-    if args.k_start == -1:
-        start = 0
+    if args.fold is not None:
+        # a single fold, e.g. one task of a SLURM array
+        start, end = args.fold, args.fold + 1
     else:
-        start = args.k_start
-    if args.k_end == -1:
-        end = args.k
-    else:
-        end = args.k_end
+        start = 0 if args.k_start == -1 else args.k_start
+        end = args.k if args.k_end == -1 else args.k_end
 
     all_test_auc = []
     all_val_auc = []
@@ -55,8 +53,10 @@ def main(args):
         filename = os.path.join(args.results_dir, 'split_{}_results.pkl'.format(i))
         save_pkl(filename, results)
 
-    final_df = pd.DataFrame({'folds': folds, 'test_auc': all_test_auc, 
-        'val_auc': all_val_auc, 'test_acc': all_test_acc, 'val_acc' : all_val_acc})
+    # train() returns (auc, auc, acc, acc) for classification and (pcc, pcc, mse, mse) for regression
+    names = ['pcc', 'mse'] if args.is_regression else ['auc', 'acc']
+    final_df = pd.DataFrame({'folds': folds, 'test_' + names[0]: all_test_auc,
+        'val_' + names[0]: all_val_auc, 'test_' + names[1]: all_test_acc, 'val_' + names[1]: all_val_acc})
 
     if len(folds) != args.k:
         save_name = 'summary_partial_{}_{}.csv'.format(start, end)
@@ -66,9 +66,11 @@ def main(args):
 
 # Generic training settings
 parser = argparse.ArgumentParser(description='Configurations for WSI Training')
-parser.add_argument('--data_root_dir', type=str, default=None, 
-                    help='data directory')
-parser.add_argument('--embed_dim', type=int, default=1024)
+parser.add_argument('--csv_path', type=str, required=True,
+                    help='label table (slide_id, case_id, label, ERP_label)')
+parser.add_argument('--data_root_dir', type=str, required=True,
+                    help='directory with one feature .h5 per slide (TRIDENT output)')
+parser.add_argument('--embed_dim', type=int, default=768, help='patch feature size (768 for CONCH v1.5)')
 parser.add_argument('--max_epochs', type=int, default=200,
                     help='maximum number of epochs to train (default: 200)')
 parser.add_argument('--lr', type=float, default=1e-4,
@@ -82,23 +84,29 @@ parser.add_argument('--seed', type=int, default=1,
 parser.add_argument('--k', type=int, default=10, help='number of folds (default: 10)')
 parser.add_argument('--k_start', type=int, default=-1, help='start fold (default: -1, last fold)')
 parser.add_argument('--k_end', type=int, default=-1, help='end fold (default: -1, first fold)')
+parser.add_argument('--fold', type=int, default=None, help='train a single fold; overrides k_start/k_end')
 parser.add_argument('--results_dir', default='./results', help='results directory (default: ./results)')
 parser.add_argument('--split_dir', type=str, default=None, 
-                    help='manually specify the set of splits to use, ' 
-                    +'instead of infering from the task and label_frac argument (default: None)')
+                    help='directory with splits_<k>.csv from create_splits_seq.py '
+                    +'(default: splits/<task>_<label_frac*100>)')
 parser.add_argument('--log_data', action='store_true', default=False, help='log data using tensorboard')
 parser.add_argument('--testing', action='store_true', default=False, help='debugging tool')
 parser.add_argument('--early_stopping', action='store_true', default=False, help='enable early stopping')
+parser.add_argument('--patience', type=int, default=20,
+                    help='early stopping: epochs without validation loss improvement (default: 20)')
+parser.add_argument('--stop_epoch', type=int, default=50,
+                    help='early stopping: earliest epoch at which training may stop (default: 50)')
 parser.add_argument('--opt', type=str, choices = ['adam', 'sgd'], default='adam')
 parser.add_argument('--drop_out', type=float, default=0.25, help='dropout')
 parser.add_argument('--bag_loss', type=str, choices=['svm', 'ce'], default='ce',
                      help='slide-level classification loss function (default: ce)')
 parser.add_argument('--model_type', type=str, choices=['clam_sb', 'clam_mb', 'mil'], default='clam_sb', 
-                    help='type of model (default: clam_sb, clam w/ single attention branch)')
+                    help='type of model (default: clam_sb, clam w/ single attention branch); '
+                    +'regression tasks always use clam_reg')
 parser.add_argument('--exp_code', type=str, help='experiment code for saving results')
 parser.add_argument('--weighted_sample', action='store_true', default=False, help='enable weighted sampling')
 parser.add_argument('--model_size', type=str, choices=['small', 'big'], default='small', help='size of model, does not affect mil')
-parser.add_argument('--task', type=str, choices=['task_1_tumor_vs_normal',  'task_2_tumor_subtyping'])
+parser.add_argument('--task', type=str, choices=list(TASKS), required=True)
 ### CLAM specific options
 parser.add_argument('--no_inst_cluster', action='store_true', default=False,
                      help='disable instance-level clustering')
@@ -126,7 +134,6 @@ def seed_torch(seed=7):
 
 seed_torch(args.seed)
 
-encoding_size = 1024
 settings = {'num_splits': args.k, 
             'k_start': args.k_start,
             'k_end': args.k_end,
@@ -143,43 +150,27 @@ settings = {'num_splits': args.k,
             'model_size': args.model_size,
             "use_drop_out": args.drop_out,
             'weighted_sample': args.weighted_sample,
-            'opt': args.opt}
+            'opt': args.opt,
+            'embed_dim': args.embed_dim,
+            'early_stopping': args.early_stopping,
+            'patience': args.patience,
+            'stop_epoch': args.stop_epoch,
+            'csv_path': args.csv_path,
+            'data_root_dir': args.data_root_dir}
+
+print('\nLoad Dataset')
+
+dataset, args.n_classes, args.is_regression = build_dataset(
+    args.task, args.csv_path, data_dir=args.data_root_dir, seed=args.seed)
+if args.is_regression:
+    args.model_type = 'clam_reg'
+    settings['model_type'] = args.model_type
 
 if args.model_type in ['clam_sb', 'clam_mb']:
    settings.update({'bag_weight': args.bag_weight,
                     'inst_loss': args.inst_loss,
                     'B': args.B})
 
-print('\nLoad Dataset')
-
-if args.task == 'task_1_tumor_vs_normal':
-    args.n_classes=2
-    dataset = Generic_MIL_Dataset(csv_path = 'dataset_csv/tumor_vs_normal_dummy_clean.csv',
-                            data_dir= os.path.join(args.data_root_dir, 'tumor_vs_normal_resnet_features'),
-                            shuffle = False, 
-                            seed = args.seed, 
-                            print_info = True,
-                            label_dict = {'normal_tissue':0, 'tumor_tissue':1},
-                            patient_strat=False,
-                            ignore=[])
-
-elif args.task == 'task_2_tumor_subtyping':
-    args.n_classes=3
-    dataset = Generic_MIL_Dataset(csv_path = 'dataset_csv/tumor_subtyping_dummy_clean.csv',
-                            data_dir= os.path.join(args.data_root_dir, 'tumor_subtyping_resnet_features'),
-                            shuffle = False, 
-                            seed = args.seed, 
-                            print_info = True,
-                            label_dict = {'subtype_1':0, 'subtype_2':1, 'subtype_3':2},
-                            patient_strat= False,
-                            ignore=[])
-
-    if args.model_type in ['clam_sb', 'clam_mb']:
-        assert args.subtyping 
-        
-else:
-    raise NotImplementedError
-    
 if not os.path.isdir(args.results_dir):
     os.mkdir(args.results_dir)
 
@@ -189,8 +180,6 @@ if not os.path.isdir(args.results_dir):
 
 if args.split_dir is None:
     args.split_dir = os.path.join('splits', args.task+'_{}'.format(int(args.label_frac*100)))
-else:
-    args.split_dir = os.path.join('splits', args.split_dir)
 
 print('split_dir: ', args.split_dir)
 assert os.path.isdir(args.split_dir)

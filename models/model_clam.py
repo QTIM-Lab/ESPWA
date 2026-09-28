@@ -108,12 +108,14 @@ class CLAM_SB(nn.Module):
         device=h.device
         if len(A.shape) == 1:
             A = A.view(1, -1)
-        top_p_ids = torch.topk(A, self.k_sample)[1][-1]
+        # sample at most as many patches as the bag holds
+        k = min(self.k_sample, A.size(-1))
+        top_p_ids = torch.topk(A, k)[1][-1]
         top_p = torch.index_select(h, dim=0, index=top_p_ids)
-        top_n_ids = torch.topk(-A, self.k_sample, dim=1)[1][-1]
+        top_n_ids = torch.topk(-A, k, dim=1)[1][-1]
         top_n = torch.index_select(h, dim=0, index=top_n_ids)
-        p_targets = self.create_positive_targets(self.k_sample, device)
-        n_targets = self.create_negative_targets(self.k_sample, device)
+        p_targets = self.create_positive_targets(k, device)
+        n_targets = self.create_negative_targets(k, device)
 
         all_targets = torch.cat([p_targets, n_targets], dim=0)
         all_instances = torch.cat([top_p, top_n], dim=0)
@@ -127,9 +129,10 @@ class CLAM_SB(nn.Module):
         device=h.device
         if len(A.shape) == 1:
             A = A.view(1, -1)
-        top_p_ids = torch.topk(A, self.k_sample)[1][-1]
+        k = min(self.k_sample, A.size(-1))
+        top_p_ids = torch.topk(A, k)[1][-1]
         top_p = torch.index_select(h, dim=0, index=top_p_ids)
-        p_targets = self.create_negative_targets(self.k_sample, device)
+        p_targets = self.create_negative_targets(k, device)
         logits = classifier(top_p)
         p_preds = torch.topk(logits, 1, dim = 1)[1].squeeze(1)
         instance_loss = self.instance_loss_fn(logits, p_targets)
@@ -179,6 +182,46 @@ class CLAM_SB(nn.Module):
         if return_features:
             results_dict.update({'features': M})
         return logits, Y_prob, Y_hat, A_raw, results_dict
+
+"""
+CLAM regression head (used for quantitative ER expression)
+Same feature projection and gated attention as CLAM_SB, with a single
+linear output instead of the bag classifier. No instance-level clustering.
+args:
+    gate: whether to use gated attention network
+    size_arg: config for network size
+    dropout: whether to use dropout
+    embed_dim: dimensionality of the input patch features
+"""
+class CLAM_REG(nn.Module):
+    def __init__(self, gate = True, size_arg = "small", dropout = 0., embed_dim=1024):
+        super().__init__()
+        self.size_dict = {"small": [embed_dim, 512, 256], "big": [embed_dim, 512, 384]}
+        size = self.size_dict[size_arg]
+        fc = [nn.Linear(size[0], size[1]), nn.ReLU(), nn.Dropout(dropout)]
+        if gate:
+            attention_net = Attn_Net_Gated(L = size[1], D = size[2], dropout = dropout, n_classes = 1)
+        else:
+            attention_net = Attn_Net(L = size[1], D = size[2], dropout = dropout, n_classes = 1)
+        fc.append(attention_net)
+        self.attention_net = nn.Sequential(*fc)
+        self.regressor = nn.Linear(size[1], 1)
+
+    def forward(self, h, label=None, instance_eval=False, return_features=False, attention_only=False):
+        A, h = self.attention_net(h)  # Nx1
+        A = torch.transpose(A, 1, 0)  # 1xN
+        if attention_only:
+            return A
+        A_raw = A
+        A = F.softmax(A, dim=1)  # softmax over N
+
+        M = torch.mm(A, h)
+        Y_hat = self.regressor(M)
+        results_dict = {}
+        if return_features:
+            results_dict.update({'features': M})
+        # same 5-tuple as CLAM_SB; the prediction stands in for logits and probabilities
+        return Y_hat, Y_hat, Y_hat, A_raw, results_dict
 
 class CLAM_MB(CLAM_SB):
     def __init__(self, gate = True, size_arg = "small", dropout = 0., k_sample=8, n_classes=2,

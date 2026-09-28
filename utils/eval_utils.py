@@ -4,24 +4,28 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from models.model_mil import MIL_fc, MIL_fc_mc
-from models.model_clam import CLAM_SB, CLAM_MB
+from models.model_clam import CLAM_SB, CLAM_MB, CLAM_REG
 import pdb
 import os
 import pandas as pd
 from utils.utils import *
-from utils.core_utils import Accuracy_Logger
+from utils.core_utils import Accuracy_Logger, Regression_Logger
 from sklearn.metrics import roc_auc_score, roc_curve, auc
 from sklearn.preprocessing import label_binarize
 import matplotlib.pyplot as plt
 
 def initiate_model(args, ckpt_path, device='cuda'):
     print('Init Model')    
-    model_dict = {"dropout": args.drop_out, 'n_classes': args.n_classes, "embed_dim": args.embed_dim}
+    model_dict = {"dropout": args.drop_out, "embed_dim": args.embed_dim}
+    if args.model_type != 'clam_reg':
+        model_dict.update({'n_classes': args.n_classes})
     
-    if args.model_size is not None and args.model_type in ['clam_sb', 'clam_mb']:
+    if args.model_size is not None and args.model_type in ['clam_sb', 'clam_mb', 'clam_reg']:
         model_dict.update({"size_arg": args.model_size})
     
-    if args.model_type =='clam_sb':
+    if args.model_type == 'clam_reg':
+        model = CLAM_REG(**model_dict)
+    elif args.model_type =='clam_sb':
         model = CLAM_SB(**model_dict)
     elif args.model_type =='clam_mb':
         model = CLAM_MB(**model_dict)
@@ -49,7 +53,13 @@ def eval(dataset, args, ckpt_path):
     model = initiate_model(args, ckpt_path)
     
     print('Init Loaders')
-    loader = get_simple_loader(dataset)
+    loader = get_simple_loader(dataset, is_regression=args.is_regression)
+    if args.is_regression:
+        # regression reports (mse, pcc) in the (test_error, auc) slots
+        patient_results, mse, pcc, df = summary_regression(model, loader)
+        print('mse: ', mse)
+        print('pcc: ', pcc)
+        return model, patient_results, mse, pcc, df
     patient_results, test_error, auc, df, _ = summary(model, loader, args)
     print('test_error: ', test_error)
     print('auc: ', auc)
@@ -116,3 +126,28 @@ def summary(model, loader, args):
         results_dict.update({'p_{}'.format(c): all_probs[:,c]})
     df = pd.DataFrame(results_dict)
     return patient_results, test_error, auc_score, df, acc_logger
+
+def summary_regression(model, loader):
+    reg_logger = Regression_Logger()
+    model.eval()
+
+    all_preds = np.zeros(len(loader))
+    all_labels = np.zeros(len(loader))
+
+    slide_ids = loader.dataset.slide_data['slide_id']
+    patient_results = {}
+    for batch_idx, (data, label) in enumerate(loader):
+        data, label = data.to(device), label.to(device).float().view(-1, 1)
+        slide_id = slide_ids.iloc[batch_idx]
+        with torch.inference_mode():
+            Y_hat, _, _, _, _ = model(data)
+
+        pred = Y_hat.item()
+        reg_logger.log(pred, label.item())
+        all_preds[batch_idx] = pred
+        all_labels[batch_idx] = label.item()
+        patient_results.update({slide_id: {'slide_id': np.array(slide_id), 'pred': pred, 'label': label.item()}})
+
+    metrics = reg_logger.get_metrics()
+    df = pd.DataFrame({'slide_id': slide_ids, 'Y': all_labels, 'Y_hat': all_preds})
+    return patient_results, metrics['mse'], metrics['pcc'], df

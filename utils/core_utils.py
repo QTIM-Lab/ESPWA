@@ -4,7 +4,7 @@ from utils.utils import *
 import os
 from dataset_modules.dataset_generic import save_splits
 from models.model_mil import MIL_fc, MIL_fc_mc
-from models.model_clam import CLAM_MB, CLAM_SB
+from models.model_clam import CLAM_MB, CLAM_SB, CLAM_REG
 from sklearn.preprocessing import label_binarize
 from sklearn.metrics import roc_auc_score, roc_curve
 from sklearn.metrics import auc as calc_auc
@@ -46,6 +46,27 @@ class Accuracy_Logger(object):
         
         return acc, correct, count
 
+class Regression_Logger(object):
+    """Regression metrics logger (MSE, RMSE, Pearson correlation)"""
+    def __init__(self):
+        super().__init__()
+        self.initialize()
+
+    def initialize(self):
+        self.predictions = []
+        self.labels = []
+
+    def log(self, Y_hat, Y):
+        self.predictions.append(float(Y_hat))
+        self.labels.append(float(Y))
+
+    def get_metrics(self):
+        preds = np.array(self.predictions)
+        labels = np.array(self.labels)
+        mse = float(np.mean((preds - labels) ** 2))
+        pcc = calculate_pcc(preds, labels)
+        return {'mse': mse, 'rmse': float(np.sqrt(mse)), 'pcc': pcc}
+
 class EarlyStopping:
     """Early stops the training if validation loss doesn't improve after a given patience."""
     def __init__(self, patience=20, stop_epoch=50, verbose=False):
@@ -63,7 +84,7 @@ class EarlyStopping:
         self.counter = 0
         self.best_score = None
         self.early_stop = False
-        self.val_loss_min = np.Inf
+        self.val_loss_min = np.inf
 
     def __call__(self, epoch, val_loss, model, ckpt_name = 'checkpoint.pt'):
 
@@ -114,7 +135,9 @@ def train(datasets, cur, args):
     print("Testing on {} samples".format(len(test_split)))
 
     print('\nInit loss function...', end=' ')
-    if args.bag_loss == 'svm':
+    if args.is_regression:
+        loss_fn = nn.MSELoss()
+    elif args.bag_loss == 'svm':
         from topk.svm import SmoothTop1SVM
         loss_fn = SmoothTop1SVM(n_classes = args.n_classes)
         if device.type == 'cuda':
@@ -125,13 +148,17 @@ def train(datasets, cur, args):
     
     print('\nInit Model...', end=' ')
     model_dict = {"dropout": args.drop_out, 
-                  'n_classes': args.n_classes, 
                   "embed_dim": args.embed_dim}
+    if not args.is_regression:
+        model_dict.update({'n_classes': args.n_classes})
     
     if args.model_size is not None and args.model_type != 'mil':
         model_dict.update({"size_arg": args.model_size})
     
-    if args.model_type in ['clam_sb', 'clam_mb']:
+    if args.model_type == 'clam_reg':
+        model = CLAM_REG(**model_dict)
+
+    elif args.model_type in ['clam_sb', 'clam_mb']:
         if args.subtyping:
             model_dict.update({'subtyping': True})
         
@@ -168,21 +195,26 @@ def train(datasets, cur, args):
     print('Done!')
     
     print('\nInit Loaders...', end=' ')
-    train_loader = get_split_loader(train_split, training=True, testing = args.testing, weighted = args.weighted_sample)
-    val_loader = get_split_loader(val_split,  testing = args.testing)
-    test_loader = get_split_loader(test_split, testing = args.testing)
+    train_loader = get_split_loader(train_split, training=True, testing = args.testing, weighted = args.weighted_sample, is_regression = args.is_regression)
+    val_loader = get_split_loader(val_split,  testing = args.testing, is_regression = args.is_regression)
+    test_loader = get_split_loader(test_split, testing = args.testing, is_regression = args.is_regression)
     print('Done!')
 
     print('\nSetup EarlyStopping...', end=' ')
     if args.early_stopping:
-        early_stopping = EarlyStopping(patience = 20, stop_epoch=50, verbose = True)
+        early_stopping = EarlyStopping(patience = args.patience, stop_epoch = args.stop_epoch, verbose = True)
 
     else:
         early_stopping = None
     print('Done!')
 
     for epoch in range(args.max_epochs):
-        if args.model_type in ['clam_sb', 'clam_mb'] and not args.no_inst_cluster:     
+        if args.is_regression:
+            train_loop_regression(epoch, model, train_loader, optimizer, writer, loss_fn)
+            stop = validate_regression(cur, epoch, model, val_loader,
+                early_stopping, writer, loss_fn, args.results_dir)
+
+        elif args.model_type in ['clam_sb', 'clam_mb'] and not args.no_inst_cluster:     
             train_loop_clam(epoch, model, train_loader, optimizer, args.n_classes, args.bag_weight, writer, loss_fn)
             stop = validate_clam(cur, epoch, model, val_loader, args.n_classes, 
                 early_stopping, writer, loss_fn, args.results_dir)
@@ -199,6 +231,21 @@ def train(datasets, cur, args):
         model.load_state_dict(torch.load(os.path.join(args.results_dir, "s_{}_checkpoint.pt".format(cur))))
     else:
         torch.save(model.state_dict(), os.path.join(args.results_dir, "s_{}_checkpoint.pt".format(cur)))
+
+    if args.is_regression:
+        _, val_mse, val_pcc = summary_regression(model, val_loader)
+        print('Val MSE: {:.4f}, PCC: {:.4f}'.format(val_mse, val_pcc))
+
+        results_dict, test_mse, test_pcc = summary_regression(model, test_loader)
+        print('Test MSE: {:.4f}, PCC: {:.4f}'.format(test_mse, test_pcc))
+
+        if writer:
+            writer.add_scalar('final/val_mse', val_mse, 0)
+            writer.add_scalar('final/val_pcc', val_pcc, 0)
+            writer.add_scalar('final/test_mse', test_mse, 0)
+            writer.add_scalar('final/test_pcc', test_pcc, 0)
+            writer.close()
+        return results_dict, test_pcc, val_pcc, test_mse, val_mse
 
     _, val_error, val_auc, _= summary(model, val_loader, args.n_classes)
     print('Val error: {:.4f}, ROC AUC: {:.4f}'.format(val_error, val_auc))
@@ -481,6 +528,90 @@ def validate_clam(cur, epoch, model, loader, n_classes, early_stopping = None, w
             return True
 
     return False
+
+def train_loop_regression(epoch, model, loader, optimizer, writer = None, loss_fn = None):
+    model.train()
+    reg_logger = Regression_Logger()
+    train_loss = 0.
+
+    print('\n')
+    for batch_idx, (data, label) in enumerate(loader):
+        data, label = data.to(device), label.to(device).float().view(-1, 1)
+        Y_hat, _, _, _, _ = model(data)
+        reg_logger.log(Y_hat.item(), label.item())
+
+        loss = loss_fn(Y_hat, label)
+        loss_value = loss.item()
+        train_loss += loss_value
+        if (batch_idx + 1) % 20 == 0:
+            print('batch {}, loss: {:.4f}, label: {:.4f}, prediction: {:.4f}, bag_size: {}'.format(
+                batch_idx, loss_value, label.item(), Y_hat.item(), data.size(0)))
+
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+    train_loss /= len(loader)
+    metrics = reg_logger.get_metrics()
+    print('Epoch: {}, train_loss: {:.4f}, train_rmse: {:.4f}, train_pcc: {:.4f}'.format(
+        epoch, train_loss, metrics['rmse'], metrics['pcc']))
+
+    if writer:
+        writer.add_scalar('train/loss', train_loss, epoch)
+        writer.add_scalar('train/rmse', metrics['rmse'], epoch)
+        writer.add_scalar('train/pcc', metrics['pcc'], epoch)
+
+def validate_regression(cur, epoch, model, loader, early_stopping = None, writer = None, loss_fn = None, results_dir = None):
+    model.eval()
+    reg_logger = Regression_Logger()
+    val_loss = 0.
+
+    with torch.inference_mode():
+        for batch_idx, (data, label) in enumerate(loader):
+            data, label = data.to(device), label.to(device).float().view(-1, 1)
+            Y_hat, _, _, _, _ = model(data)
+            reg_logger.log(Y_hat.item(), label.item())
+            val_loss += loss_fn(Y_hat, label).item()
+
+    val_loss /= len(loader)
+    metrics = reg_logger.get_metrics()
+    print('\nVal Set, val_loss: {:.4f}, val_rmse: {:.4f}, val_pcc: {:.4f}'.format(
+        val_loss, metrics['rmse'], metrics['pcc']))
+
+    if writer:
+        writer.add_scalar('val/loss', val_loss, epoch)
+        writer.add_scalar('val/rmse', metrics['rmse'], epoch)
+        writer.add_scalar('val/pcc', metrics['pcc'], epoch)
+
+    if early_stopping:
+        assert results_dir
+        early_stopping(epoch, val_loss, model, ckpt_name = os.path.join(results_dir, "s_{}_checkpoint.pt".format(cur)))
+
+        if early_stopping.early_stop:
+            print("Early stopping")
+            return True
+
+    return False
+
+def summary_regression(model, loader):
+    reg_logger = Regression_Logger()
+    model.eval()
+
+    slide_ids = loader.dataset.slide_data['slide_id']
+    patient_results = {}
+
+    for batch_idx, (data, label) in enumerate(loader):
+        data, label = data.to(device), label.to(device).float().view(-1, 1)
+        slide_id = slide_ids.iloc[batch_idx]
+        with torch.inference_mode():
+            Y_hat, _, _, _, _ = model(data)
+
+        pred = Y_hat.item()
+        reg_logger.log(pred, label.item())
+        patient_results.update({slide_id: {'slide_id': np.array(slide_id), 'pred': pred, 'label': label.item()}})
+
+    metrics = reg_logger.get_metrics()
+    return patient_results, metrics['mse'], metrics['pcc']
 
 def summary(model, loader, n_classes):
     acc_logger = Accuracy_Logger(n_classes=n_classes)

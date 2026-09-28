@@ -11,14 +11,18 @@ import pandas as pd
 from utils.utils import *
 from math import floor
 import matplotlib.pyplot as plt
-from dataset_modules.dataset_generic import Generic_WSI_Classification_Dataset, Generic_MIL_Dataset, save_splits
+from dataset_modules.espwa_tasks import TASKS, build_dataset
 import h5py
 from utils.eval_utils import *
 
 # Training settings
 parser = argparse.ArgumentParser(description='CLAM Evaluation Script')
-parser.add_argument('--data_root_dir', type=str, default=None,
-                    help='data directory')
+parser.add_argument('--csv_path', type=str, required=True,
+                    help='label table of the slides to evaluate (slide_id, case_id, label, ERP_label)')
+parser.add_argument('--data_root_dir', type=str, required=True,
+                    help='directory with one feature .h5 per slide (TRIDENT output)')
+parser.add_argument('--eval_dir', type=str, default='./eval_results',
+                    help='where EVAL_<save_exp_code> is written (default: ./eval_results)')
 parser.add_argument('--results_dir', type=str, default='./results',
                     help='relative path to results folder, i.e. '+
                     'the directory containing models_exp_code relative to project root (default: ./results)')
@@ -31,22 +35,23 @@ parser.add_argument('--splits_dir', type=str, default=None,
 parser.add_argument('--model_size', type=str, choices=['small', 'big'], default='small', 
                     help='size of model (default: small)')
 parser.add_argument('--model_type', type=str, choices=['clam_sb', 'clam_mb', 'mil'], default='clam_sb', 
-                    help='type of model (default: clam_sb)')
+                    help='type of model (default: clam_sb); regression tasks always use clam_reg')
 parser.add_argument('--k', type=int, default=10, help='number of folds (default: 10)')
 parser.add_argument('--k_start', type=int, default=-1, help='start fold (default: -1, last fold)')
 parser.add_argument('--k_end', type=int, default=-1, help='end fold (default: -1, first fold)')
 parser.add_argument('--fold', type=int, default=-1, help='single fold to evaluate')
 parser.add_argument('--micro_average', action='store_true', default=False, 
                     help='use micro_average instead of macro_avearge for multiclass AUC')
-parser.add_argument('--split', type=str, choices=['train', 'val', 'test', 'all'], default='test')
-parser.add_argument('--task', type=str, choices=['task_1_tumor_vs_normal',  'task_2_tumor_subtyping'])
+parser.add_argument('--split', type=str, choices=['train', 'val', 'test', 'all'], default='test',
+                    help="'all' scores every slide in --csv_path with each fold's model (external cohorts)")
+parser.add_argument('--task', type=str, choices=list(TASKS), required=True)
 parser.add_argument('--drop_out', type=float, default=0.25, help='dropout')
-parser.add_argument('--embed_dim', type=int, default=1024)
+parser.add_argument('--embed_dim', type=int, default=768, help='patch feature size (768 for CONCH v1.5)')
 args = parser.parse_args()
 
 device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-args.save_dir = os.path.join('./eval_results', 'EVAL_' + str(args.save_exp_code))
+args.save_dir = os.path.join(args.eval_dir, 'EVAL_' + str(args.save_exp_code))
 args.models_dir = os.path.join(args.results_dir, str(args.models_exp_code))
 
 os.makedirs(args.save_dir, exist_ok=True)
@@ -57,7 +62,12 @@ if args.splits_dir is None:
 assert os.path.isdir(args.models_dir)
 assert os.path.isdir(args.splits_dir)
 
+if TASKS[args.task]['is_regression']:
+    args.model_type = 'clam_reg'
+
 settings = {'task': args.task,
+            'csv_path': args.csv_path,
+            'data_root_dir': args.data_root_dir,
             'split': args.split,
             'save_dir': args.save_dir, 
             'models_dir': args.models_dir,
@@ -70,38 +80,8 @@ with open(args.save_dir + '/eval_experiment_{}.txt'.format(args.save_exp_code), 
 f.close()
 
 print(settings)
-if args.task == 'task_1_tumor_vs_normal':
-    args.n_classes=2
-    dataset = Generic_MIL_Dataset(csv_path = 'dataset_csv/tumor_vs_normal_dummy_clean.csv',
-                            data_dir= os.path.join(args.data_root_dir, 'tumor_vs_normal_resnet_features'),
-                            shuffle = False, 
-                            print_info = True,
-                            label_dict = {'normal_tissue':0, 'tumor_tissue':1},
-                            patient_strat=False,
-                            ignore=[])
-
-elif args.task == 'task_2_tumor_subtyping':
-    args.n_classes=3
-    dataset = Generic_MIL_Dataset(csv_path = 'dataset_csv/tumor_subtyping_dummy_clean.csv',
-                            data_dir= os.path.join(args.data_root_dir, 'tumor_subtyping_resnet_features'),
-                            shuffle = False, 
-                            print_info = True,
-                            label_dict = {'subtype_1':0, 'subtype_2':1, 'subtype_3':2},
-                            patient_strat= False,
-                            ignore=[])
-
-# elif args.task == 'tcga_kidney_cv':
-#     args.n_classes=3
-#     dataset = Generic_MIL_Dataset(csv_path = 'dataset_csv/tcga_kidney_clean.csv',
-#                             data_dir= os.path.join(args.data_root_dir, 'tcga_kidney_20x_features'),
-#                             shuffle = False, 
-#                             print_info = True,
-#                             label_dict = {'TCGA-KICH':0, 'TCGA-KIRC':1, 'TCGA-KIRP':2},
-#                             patient_strat= False,
-#                             ignore=['TCGA-SARC'])
-
-else:
-    raise NotImplementedError
+dataset, args.n_classes, args.is_regression = build_dataset(
+    args.task, args.csv_path, data_dir=args.data_root_dir, patient_strat=False)
 
 if args.k_start == -1:
     start = 0
@@ -136,7 +116,11 @@ if __name__ == "__main__":
         all_acc.append(1-test_error)
         df.to_csv(os.path.join(args.save_dir, 'fold_{}.csv'.format(folds[ckpt_idx])), index=False)
 
-    final_df = pd.DataFrame({'folds': folds, 'test_auc': all_auc, 'test_acc': all_acc})
+    if args.is_regression:
+        # eval() returns (mse, pcc) in the (test_error, auc) slots; all_acc holds 1 - mse
+        final_df = pd.DataFrame({'folds': folds, 'test_pcc': all_auc, 'test_mse': [1 - a for a in all_acc]})
+    else:
+        final_df = pd.DataFrame({'folds': folds, 'test_auc': all_auc, 'test_acc': all_acc})
     if len(folds) != args.k:
         save_name = 'summary_partial_{}_{}.csv'.format(folds[0], folds[-1])
     else:

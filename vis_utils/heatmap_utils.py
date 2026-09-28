@@ -23,8 +23,11 @@ from tqdm import tqdm
 device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def score2percentile(score, ref):
-    percentile = percentileofscore(ref, score)
-    return percentile
+    # percentile of each score within ref, keeping the shape of score
+    ref = np.asarray(ref).ravel()
+    score = np.asarray(score)
+    percentiles = np.array([percentileofscore(ref, float(x)) for x in score.ravel()], dtype=np.float32)
+    return percentiles.reshape(score.shape)
 
 def drawHeatmap(scores, coords, slide_path=None, wsi_object=None, vis_level = -1, **kwargs):
     if wsi_object is None:
@@ -73,7 +76,7 @@ def compute_from_patches(wsi_object, img_transforms, feature_extractor=None, cla
                 if A.size(0) > 1: #CLAM multi-branch attention
                     A = A[clam_pred]
 
-                A = A.view(-1, 1).cpu().numpy()
+                A = A.view(-1).cpu().numpy()
 
                 if ref_scores is not None:
                     for score_idx in range(len(A)):
