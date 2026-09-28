@@ -1,0 +1,19 @@
+# Training, evaluation and heatmaps (tested with Python 3.10 and the versions below).
+# Feature extraction runs in a separate TRIDENT environment; see scripts/extract_features.sh.
+torch>=2.1          # tested 2.7.1
+torchvision>=0.16   # tested 0.22.1
+numpy>=1.24         # tested 2.2.6
+pandas>=2.0         # tested 2.2.3
+scipy>=1.10         # tested 1.15.3
+scikit-learn>=1.3   # tested 1.6.1
+h5py>=3.8           # tested 3.14.0
+tensorboardX
+tqdm
+matplotlib
+pyyaml
+# attention heatmaps only
+openslide-python    # also needs the OpenSlide C library
+opencv-python
+pillow
+timm
+transformers        # loads CONCH v1.5 through MahmoodLab/TITAN (gated on Hugging Face)
